@@ -1,0 +1,10 @@
+.conda
+.ipynb_checkpoints
+.Trash-0
+__pycache__/
+.vscode
+songs/
+*.pyc
+*.pyo
+*.pyd
+*.swp
