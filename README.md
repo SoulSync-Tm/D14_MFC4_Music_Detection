@@ -23,6 +23,37 @@ This system implements industry-standard Shazam-style audio fingerprinting featu
 - **Fingerprint Generation**: Anchor-target pairing with deterministic SHA-256 hashing
 - **Temporal Locality**: Configurable fan-out and time delta windows
 
+---
+
+## 🔥 Why Does Audio Need Preprocessing?
+
+Real-world audio recordings are rarely clean. Noise and distortion are introduced at multiple stages of the recording chain, making raw audio unreliable for direct fingerprinting. Common sources include:
+
+| Source | Description |
+|---|---|
+| **Cheap Microphones** | Low-quality capsules introduce self-noise and frequency coloration, adding a constant noise floor to recordings |
+| **ADC Imperfections** | Analog-to-Digital Converters introduce quantization noise, clipping, and non-linearity errors during the analog → digital conversion |
+| **Recording Devices** | Interference from device electronics, power supply hum (50/60 Hz), and poor shielding bleed into the audio signal |
+| **Compression Artifacts** | Lossy codecs (MP3, AAC) discard high-frequency detail and introduce ringing/pre-echo artifacts, altering the spectral content |
+
+> This is common in all recorded audio — even professional recordings contain low-level noise from the environment, equipment, and encoding pipeline.
+
+### 🛠️ How Preprocessing Fixes This
+
+Before fingerprinting, the audio pipeline applies a series of normalisation and conditioning steps to strip away noise and produce a consistent, comparable signal:
+
+1. **Mono Conversion** — Collapses stereo channels into a single channel. Eliminates channel imbalance and halves data size without losing tonal information relevant to fingerprinting.
+
+2. **Resampling to 22050 Hz** — Standardises the sample rate across all recordings. This ensures fingerprints generated from different devices (phones, studio mics, web streams) are directly comparable. 22050 Hz is sufficient to capture frequencies up to 11025 Hz — well above the perceptually relevant range.
+
+3. **Amplitude Normalisation** — Scales the waveform so the peak amplitude is ±1. Removes volume differences caused by recording level, gain staging, or playback volume — so a quiet recording and a loud recording of the same song produce the same fingerprint.
+
+4. **Spectral Peak Thresholding** — During STFT analysis, a percentile threshold (default: 75th percentile) discards low-energy spectral bins that are more likely to contain noise than musical content. Only the strongest, most stable peaks are retained as landmarks.
+
+Together, these steps ensure the fingerprinting system focuses on the **stable spectral structure** of a song rather than the noise layered on top of it — making identification robust even when the query audio is low-quality or recorded in a noisy environment.
+
+---
+
 ## 🚀 Quick Start
 
 ### Prerequisites
