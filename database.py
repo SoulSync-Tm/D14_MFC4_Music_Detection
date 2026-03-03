@@ -82,6 +82,36 @@ def match_fingerprint(conn, hash_value):
     )
     return c.fetchall()
 
+
+def match_fingerprints_bulk(conn, hash_values):
+    """
+    Batch-query fingerprints for a list of hash values in a single SQL call.
+
+    Returns list of (hash_value, song_id, time_offset).
+    Chunks requests to stay under SQLite's 999-parameter limit.
+
+    Parameters:
+        conn        : open sqlite3.Connection
+        hash_values : list of integer hash values
+    """
+    if not hash_values:
+        return []
+
+    results    = []
+    chunk_size = 900
+
+    for i in range(0, len(hash_values), chunk_size):
+        chunk        = hash_values[i : i + chunk_size]
+        placeholders = ",".join("?" * len(chunk))
+        rows = conn.execute(
+            f"SELECT hash_value, song_id, time_offset FROM fingerprints "
+            f"WHERE hash_value IN ({placeholders})",
+            chunk
+        ).fetchall()
+        results.extend(rows)
+
+    return results
+
 def get_fingerprints(conn, song_id):
     """
     Retrieve all (hash_value, time_offset) rows for a song.
