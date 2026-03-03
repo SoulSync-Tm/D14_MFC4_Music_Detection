@@ -1,6 +1,11 @@
 """
 Create short audio samples (clean + noisy) from songs for query testing.
 
+Sampling strategy:
+  The song is divided into N_SAMPLES equal-width segments. A random start
+  point is chosen within each segment, so clips are both randomized and
+  equally distributed across the full duration.
+
 Output structure:
     songs/
     ├── samples/           <- clean clips
@@ -30,8 +35,10 @@ SUPPORTED_EXTENSIONS = {".mp3", ".wav", ".flac", ".ogg"}
 CLIP_DURATION  = 4       # seconds per sample
 TARGET_SR      = 22050   # output sample rate
 
-# Start offsets (in seconds) for each sample — spreads across the song
-CLIP_OFFSETS = [15, 30, 45, 60, 90, 120, 150]
+# Number of clips to extract per song.
+# The song is split into this many equal segments and one clip is picked
+# at a random position within each segment.
+N_SAMPLES = 10
 
 # Noise profiles applied to each clip (name, SNR dB)
 # Lower SNR = more noise = harder match
@@ -79,7 +86,7 @@ def main():
     total_noisy = 0
 
     print(f"Found {len(song_files)} song(s).")
-    print(f"Offsets : {CLIP_OFFSETS}")
+    print(f"Samples : {N_SAMPLES} per song (randomised + equally distributed)")
     print(f"Noise   : {[p[0] for p in NOISE_PROFILES]}\n")
 
     for filename in sorted(song_files):
@@ -91,12 +98,25 @@ def main():
         try:
             duration = librosa.get_duration(path=audio_path)
 
-            for i, start in enumerate(CLIP_OFFSETS, start=1):
-                if start >= duration:
-                    print(f"    [{i}] offset {start}s exceeds duration ({duration:.1f}s), skipping.")
-                    continue
+            usable = duration - CLIP_DURATION
+            if usable <= 0:
+                print(f"    Song too short ({duration:.1f}s < {CLIP_DURATION}s clip), skipping.")
+                continue
 
-                actual_dur = min(CLIP_DURATION, duration - start)
+            # Divide usable range into equal segments, pick a random point in each
+            segment_size = usable / N_SAMPLES
+            offsets = [
+                float(np.clip(
+                    np.random.uniform(i * segment_size, (i + 1) * segment_size),
+                    0, usable
+                ))
+                for i in range(N_SAMPLES)
+            ]
+
+            print(f"    Duration: {duration:.1f}s | Offsets: {[f'{o:.1f}s' for o in offsets]}")
+
+            for i, start in enumerate(offsets, start=1):
+                actual_dur = CLIP_DURATION  # always full clip length
 
                 # --- Clean clip ---
                 clean_path = os.path.join(SAMPLES_DIR, f"{song_name}_sample_{i}.wav")
@@ -107,7 +127,7 @@ def main():
                     y_clean = load_clip(audio_path, start, actual_dur)
                     sf.write(clean_path, y_clean, TARGET_SR)
                     total_clean += 1
-                    print(f"    [{i}] clean saved ({actual_dur:.1f}s from {start}s).")
+                    print(f"    [{i}] clean saved ({actual_dur:.1f}s from {start:.1f}s).")
 
                 # --- Noisy clips ---
                 for profile_name, snr_db in NOISE_PROFILES:
