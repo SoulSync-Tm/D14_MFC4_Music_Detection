@@ -5,58 +5,18 @@ Usage:
     python scripts/match_song.py <path_to_audio_file> [--phone-mode]
 
 Example:
-    python scripts/match_song.py songs/samples/Neelothi_sample_2.wav
-    python scripts/match_song.py songs/samples_noisy/Neelothi_sample_2_heavy.wav
-    python scripts/match_song.py songs/test/thee_koluthi.wav --phone-mode
+    python scripts/match_song.py data/songs/samples/Neelothi_sample_2.wav
+    python scripts/match_song.py data/songs/test/thee_koluthi.wav --phone-mode
 """
 
 import os
 import sys
-from collections import defaultdict
 
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from fingerprint import AudioFingerprinter
-from database import get_connection, match_fingerprints_bulk
-
-MIN_CONFIDENCE = 0.02
-TOP_N          = 5
-
-
-def match(r, fp, audio_path, is_phone_mode=False):
-    y, sr  = fp.preprocess(audio_path, is_phone_mode=is_phone_mode)
-    S_db   = fp.generate_spectrogram(y)
-    peaks  = fp.find_peaks(S_db)
-    hashes = fp.generate_hashes(peaks)
-
-    n_hashes = len(hashes)
-    if n_hashes == 0:
-        return [], 0
-
-    hash_values = [int(h) for h, _ in hashes]
-
-    hash_to_query_times = defaultdict(list)
-    for h, t in hashes:
-        hash_to_query_times[int(h)].append(t)
-
-    db_rows = match_fingerprints_bulk(r, hash_values)
-
-    votes = defaultdict(lambda: defaultdict(int))
-    for hash_value, song_id, db_t in db_rows:
-        for query_t in hash_to_query_times[hash_value]:
-            votes[song_id][db_t - query_t] += 1
-
-    scores = {
-        sid: max(buckets.values()) / n_hashes
-        for sid, buckets in votes.items()
-    }
-    scores = {sid: s for sid, s in scores.items() if s >= MIN_CONFIDENCE}
-    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    return ranked[:TOP_N], n_hashes
-
-
-def song_name_from_id(r, song_id):
-    return r.hget(f"song:{song_id}", "name") or "Unknown"
+from app.core.fingerprint import AudioFingerprinter
+from app.db.redis import get_connection
+from app.services.recognition_service import match
 
 
 def main():
@@ -71,33 +31,29 @@ def main():
         print(f"File not found: {audio_path}")
         sys.exit(1)
 
-    r  = get_connection()
+    r = get_connection()
     if not r.exists("songs:counter"):
         print("No songs found in Redis — run insert_songs.py and fingerprint_songs.py first.")
         sys.exit(1)
 
     print(f"Query      : {audio_path}")
-    print(f"Phone mode : {'ON' if is_phone_mode else 'OFF'}")
-    print(f"DB         : Redis {r.connection_pool.connection_kwargs['host']}:"
-          f"{r.connection_pool.connection_kwargs['port']}\n")
+    print(f"Phone mode : {'ON' if is_phone_mode else 'OFF'}\n")
 
-    fp = AudioFingerprinter()
+    fp       = AudioFingerprinter()
+    response = match(r, fp, audio_path, is_phone_mode=is_phone_mode)
 
-    ranked, n_hashes = match(r, fp, audio_path, is_phone_mode=is_phone_mode)
+    print(f"Hashes generated : {response.n_hashes}")
+    print(f"Matches found    : {len(response.results)}\n")
 
-    print(f"Hashes generated : {n_hashes}")
-    print(f"Matches found    : {len(ranked)}\n")
-
-    if not ranked:
+    if not response.matched:
         print("No match found (confidence below threshold).")
         return
 
     print(f"  {'Rank':<6} {'Song':<35} {'Confidence':>12}")
     print(f"  {'-'*55}")
-    for rank, (song_id, conf) in enumerate(ranked, start=1):
-        name   = song_name_from_id(r, song_id)
+    for rank, result in enumerate(response.results, start=1):
         marker = "  <-- BEST MATCH" if rank == 1 else ""
-        print(f"  {rank:<6} {name:<35} {conf:>11.4f}{marker}")
+        print(f"  {rank:<6} {result.song_name:<35} {result.confidence:>11.4f}{marker}")
 
 
 if __name__ == "__main__":

@@ -1,23 +1,23 @@
 import os
 import sys
 
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from database import get_connection, create_database, insert_song
-
-SONGS_DIR = os.path.join(os.path.dirname(__file__), "..", "songs")
-
-SUPPORTED_EXTENSIONS = {".mp3", ".wav", ".flac", ".ogg"}
+from app.config import SONGS_DIR
+from app.db.redis import get_connection
+from app.db.fingerprint_repo import create_database, insert_song
+from app.utils.audio import list_audio_files
 
 
 def main():
     r = get_connection()
     create_database(r)
 
-    song_files = sorted(
-        f for f in os.listdir(SONGS_DIR)
-        if os.path.splitext(f)[1].lower() in SUPPORTED_EXTENSIONS
-    )
+    if not os.path.isdir(SONGS_DIR):
+        print(f"Songs directory not found: {SONGS_DIR}")
+        return
+
+    song_files = list_audio_files(SONGS_DIR)
 
     if not song_files:
         print("No audio files found in the songs folder.")
@@ -42,4 +42,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

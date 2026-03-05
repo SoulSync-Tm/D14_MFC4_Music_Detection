@@ -3,7 +3,7 @@
 .Trash-0
 __pycache__/
 .vscode
-songs/
+data/
 *.pyc
 *.pyo
 *.pyd
@@ -17,5 +17,4 @@ database/*.db
 database/*.db-journal
 database/*.db-wal
 database/*.db-shm
-experiment.ipynb
-toy_example.ipynb
+experiments/

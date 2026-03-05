@@ -1,8 +1,6 @@
 """
-matcher.py — Hash Lookup and Offset-Alignment Voting
-=====================================================
-
-Exposes two public functions used by the matching pipeline:
+app/core/matcher.py — Bandpass filter and offset-alignment voting
+=================================================================
 
 bandpass(y, sr, low=300, high=3400) -> np.ndarray
     4th-order Butterworth bandpass filter.  Called by ``AudioFingerprinter``
@@ -16,52 +14,25 @@ match_sample(r, sample_hashes) -> (song_id, best_offset, best_score)
        ``sample_hashes`` using a single pipeline round-trip.
     2. For every matching entry, increments a vote counter:
            votes[song_id][db_time_offset − query_time_offset] += 1
-       This offset-alignment step makes matching invariant to where in the
-       song the clip was recorded.
+       Offset-alignment makes matching invariant to playback position.
     3. Returns the (song_id, offset_bucket, vote_count) triple for the
-       peak of the vote histogram.  Returns ``(None, None, 0)`` if no
-       hashes matched.
-
-    Arguments
-    ---------
-    r             : redis.Redis — an open Redis client (decode_responses=True)
-    sample_hashes : list — [(hash_value: int, time_offset: int), ...]
-                          as returned by ``AudioFingerprinter.generate_hashes``
-
-    Returns
-    -------
-    song_id    : int | None  — primary key stored as song:{id} in Redis
-    best_offset: int | None  — most-voted time-delta bucket
-    best_score : int         — raw vote count for the winning (song, offset)
-
-Usage
------
-    from fingerprint import AudioFingerprinter
-    from matcher import match_sample
-    from database import get_connection
-
-    r      = get_connection()
-    fp     = AudioFingerprinter()
-    y, sr  = fp.preprocess("clip.wav")
-    hashes = fp.generate_hashes(fp.find_peaks(fp.generate_spectrogram(y)))
-    song_id, offset, score = match_sample(r, hashes)
-
-Dependencies
-------------
-    collections, redis, scipy.signal
+       peak of the vote histogram.  Returns ``(None, None, 0)`` on no match.
 """
 
 from collections import defaultdict
+
+import numpy as np
 from scipy.signal import butter, lfilter
 
 
-def bandpass(y, sr, low=300, high=3400):
+def bandpass(y: np.ndarray, sr: int, low: int = 300, high: int = 3400) -> np.ndarray:
+    """4th-order Butterworth bandpass filter (300–3400 Hz by default)."""
     nyq = sr / 2
-    b, a = butter(4, [low / nyq, high / nyq], btype='band')
+    b, a = butter(4, [low / nyq, high / nyq], btype="band")
     return lfilter(b, a, y)
 
 
-def match_sample(r, sample_hashes):
+def match_sample(r, sample_hashes: list) -> tuple:
     """
     Match sample hashes against the Redis fingerprint store.
 
@@ -79,24 +50,24 @@ def match_sample(r, sample_hashes):
     if not sample_hashes:
         return None, None, 0
 
-    sample_time_map = defaultdict(list)
+    sample_time_map: dict = defaultdict(list)
     for h, t in sample_hashes:
         sample_time_map[int(h)].append(t)
 
     unique_hashes = list(sample_time_map.keys())
 
-    # Fetch all matching fingerprint entries in a single pipeline round-trip
+    # Single pipeline round-trip
     pipe = r.pipeline()
     for hv in unique_hashes:
         pipe.lrange(f"fp:{hv}", 0, -1)
     raw_results = pipe.execute()
 
-    votes = defaultdict(lambda: defaultdict(int))
+    votes: dict = defaultdict(lambda: defaultdict(int))
     for hv, entries in zip(unique_hashes, raw_results):
         for entry in entries:
             sid_str, t_str = entry.split(":", 1)
-            song_id  = int(sid_str)
-            db_time  = int(t_str)
+            song_id = int(sid_str)
+            db_time = int(t_str)
             for sample_time in sample_time_map[hv]:
                 delta = int((db_time - sample_time) / 2)
                 votes[song_id][delta] += 1
@@ -109,10 +80,10 @@ def match_sample(r, sample_hashes):
     best_score   = 0
 
     for song_id, delta_map in votes.items():
-        local_best_offset, local_best_score = max(delta_map.items(), key=lambda x: x[1])
-        if local_best_score > best_score:
-            best_score   = local_best_score
+        local_offset, local_score = max(delta_map.items(), key=lambda x: x[1])
+        if local_score > best_score:
+            best_score   = local_score
             best_song_id = song_id
-            best_offset  = local_best_offset
+            best_offset  = local_offset
 
     return best_song_id, best_offset, best_score

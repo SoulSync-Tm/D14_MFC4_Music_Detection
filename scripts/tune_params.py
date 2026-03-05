@@ -29,14 +29,14 @@ from collections import defaultdict
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-from fingerprint import AudioFingerprinter
-from database import get_connection, match_fingerprints_bulk
+from app.core.fingerprint import AudioFingerprinter
+from app.db.redis import get_connection
+from app.db.fingerprint_repo import match_fingerprints_bulk
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-SAMPLES_DIR = os.path.join(os.path.dirname(__file__), "..", "songs", "samples")
-NOISY_DIR   = os.path.join(os.path.dirname(__file__), "..", "songs", "samples_noisy")
+from app.config import SAMPLES_DIR, SAMPLES_NOISY_DIR as NOISY_DIR
 NOISE_LEVELS = ["light", "medium", "heavy"]
 
 # ---------------------------------------------------------------------------

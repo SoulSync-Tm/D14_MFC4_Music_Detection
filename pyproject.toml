@@ -1,0 +1,18 @@
+[project]
+name = "music-detection"
+version = "1.0.0"
+description = "Shazam-style audio fingerprinting with Redis"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "librosa>=0.11.0",
+    "matplotlib>=3.8.0",
+    "numpy>=1.26.0",
+    "soundfile>=0.12.0",
+    "redis>=5.0.0",
+    "sounddevice>=0.4.6",
+    "scipy>=1.12.0",
+    "python-multipart>=0.0.9",
+]

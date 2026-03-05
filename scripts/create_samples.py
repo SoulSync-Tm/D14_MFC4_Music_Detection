@@ -7,7 +7,7 @@ Sampling strategy:
   equally distributed across the full duration.
 
 Output structure:
-    songs/
+    data/
     ├── samples/           <- clean clips
     │   ├── Neelothi_sample_1.wav
     │   └── ...
@@ -25,9 +25,7 @@ import librosa
 import soundfile as sf
 import numpy as np
 
-SONGS_DIR    = os.path.join(os.path.dirname(__file__), "..", "songs")
-SAMPLES_DIR  = os.path.join(SONGS_DIR, "samples")
-NOISY_DIR    = os.path.join(SONGS_DIR, "samples_noisy")
+from app.config import SONGS_DIR, SAMPLES_DIR, SAMPLES_NOISY_DIR as NOISY_DIR
 
 SUPPORTED_EXTENSIONS = {".mp3", ".wav", ".flac", ".ogg"}
 
