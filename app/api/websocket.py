@@ -1,17 +1,63 @@
 """
-app/api/websocket.py — WebSocket streaming endpoint
-=====================================================
+app/api/websocket.py — Real-time WebSocket streaming endpoint
+=============================================================
 
-WebSocket /ws/stream
-
-Protocol
+Endpoint
 --------
-Client → Server : raw PCM bytes, float32 little-endian, mono, 8 kHz.
-                  Each message = one audio packet (PACKET_DURATION seconds worth).
+WS  /ws/stream
 
-Server → Client : JSON messages, sent once per detection window step:
-    {"matched": true,  "name": "...", "confidence": 0.23, "timestamp": "14:05:01"}
-    {"matched": false}
+Wire protocol
+-------------
+Client → Server : Raw PCM binary frames, int16 little-endian, mono, 8 kHz.
+                  Each frame covers PACKET_DURATION seconds (default 0.5 s,
+                  i.e. 4 000 samples = 8 000 bytes).
+
+Server → Client : UTF-8 JSON, one message per processed window.
+
+    No match yet::
+
+        {"matched": false}
+
+    Timeout (30 s elapsed, no confirmed song)::
+
+        {"matched": false, "reason": "timeout"}
+
+    Confirmed match::
+
+        {
+          "matched":    true,
+          "name":       "Song Title",
+          "confidence": 0.23,        # average over confirming windows
+          "offset_s":   34.56,       # playback position in the original song
+          "timestamp":  "14:05:01"   # wall-clock time of confirmation
+        }
+
+Pipeline (per window)
+---------------------
+1. ``RingBuffer`` accumulates int16 PCM packets and emits sliding windows
+   of WINDOW_SIZE samples (1.2 s) with a STEP_SIZE step (0.3 s).
+
+2. ``fingerprint_only`` (CPU, thread executor)
+   STFT → log-magnitude spectrogram → peak detection → 64-bit landmark hashes.
+
+3. ``match_fingerprints_bulk`` (I/O, thread executor)
+   Single Redis pipeline round-trip — fetches all ``fp:{hash}`` lists.
+
+4. ``score_matches`` (CPU, inline)
+   Offset-alignment voting → best_id, confidence, offset_bins.
+
+5. ``ConsensusVoter`` (stateful, per-connection)
+   Requires the same song to win *threshold* (default 3) successive windows
+   before a result is considered genuine.  Suppresses single-window false
+   positives from noise bursts.
+
+6. ``SongTracker`` (stateful, per-connection)
+   Holds the last confirmed song for HOLD_TIME seconds (default 4 s) even
+   when intervening windows yield no consensus.  Prevents brief dropout
+   windows from breaking a valid match chain.
+
+7. 30-second hard timeout — if no match is confirmed within MAX_STREAM_TIME
+   the server sends a timeout JSON and closes the connection.
 """
 
 import asyncio
@@ -23,7 +69,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from app.config import MIN_CONFIDENCE, SAMPLE_RATE, WINDOW_SIZE
 from app.core.buffer import RingBuffer
 from app.core.fingerprint import AudioFingerprinter
-from app.core.matcher import fingerprint_only, score_matches
+from app.core.matcher import fingerprint_only, score_matches, ConsensusVoter, SongTracker
 from app.db.fingerprint_repo import match_fingerprints_bulk
 from app.db.redis import get_connection
 from app.utils.logging import get_logger
@@ -40,19 +86,29 @@ async def stream_audio(websocket: WebSocket):
     await websocket.accept()
     logger.info("WebSocket connection accepted from %s", websocket.client)
     r    = get_connection()
-    buf  = RingBuffer()
-    loop = asyncio.get_event_loop()
+    buf     = RingBuffer()
+    voter   = ConsensusVoter(threshold=3)
+    tracker = SongTracker(hold_time=4.0)
+    loop    = asyncio.get_event_loop()
 
+    MAX_STREAM_TIME = 30
+    start_time   = time.time()
     chunk_count  = 0
     window_count = 0
 
     try:
         while True:
+            if time.time() - start_time > MAX_STREAM_TIME:
+                logger.info("Stream timeout after %ds — no match found", MAX_STREAM_TIME)
+                await websocket.send_json({"matched": False, "reason": "timeout"})
+                await websocket.close()
+                return
+
             data = await websocket.receive_bytes()
             chunk_count += 1
-            pcm = np.frombuffer(data, dtype=np.float32)
+            pcm_int16 = np.frombuffer(data, dtype=np.int16)
+            pcm       = pcm_int16.astype(np.float32) / 32768.0
             buf.extend(pcm)
-
             logger.debug(
                 "[chunk %d] %d bytes | %d samples | buffer=%d/%d",
                 chunk_count, len(data), len(pcm), buf.buffered, WINDOW_SIZE,
@@ -83,26 +139,41 @@ async def stream_audio(websocket: WebSocket):
 
                 # CPU scoring — fast, no I/O
                 best_id, confidence, offset_bins = score_matches(hashes, hash_to_query_times, db_rows)
-                # Convert spectrogram frames → seconds: frames × hop_length / sample_rate
-                offset_s = round(offset_bins * _fp.hop_length / _fp.sample_rate, 2)
 
                 logger.info(
-                    "[window %d] best_id=%s confidence=%s offset=%.2fs threshold=%s",
-                    window_count, best_id, confidence, offset_s, MIN_CONFIDENCE,
+                    "[window %d] best_id=%s confidence=%s votes=%s threshold=%s",
+                    window_count, best_id, confidence,
+                    voter._counts.get(best_id, 0) + (1 if best_id else 0),
+                    MIN_CONFIDENCE,
                 )
 
-                if best_id and confidence >= MIN_CONFIDENCE:
-                    raw_name  = r.hget(f"song:{best_id}", "name")
-                    song_name = raw_name.decode() if isinstance(raw_name, bytes) else (raw_name or "Unknown")
+                # Consensus gate — require threshold windows to agree before confirming
+                confirmed_id, confirmed_conf, confirmed_offset = voter.vote(
+                    best_id, confidence, offset_bins
+                )
+                offset_s = round(confirmed_offset * _fp.hop_length / _fp.sample_rate, 2)
+
+                # Resolve name only on a fresh consensus hit (avoids a Redis call every window)
+                name = None
+                if confirmed_id is not None:
+                    raw_name = r.hget(f"song:{confirmed_id}", "name")
+                    name = raw_name.decode() if isinstance(raw_name, bytes) else (raw_name or "Unknown")
+
+                # Temporal smoothing — hold the song across brief dropout windows
+                active_id, active_name, active_conf, active_off_s = tracker.update(
+                    confirmed_id, confirmed_conf, offset_s, name
+                )
+
+                if active_id is not None and active_conf >= MIN_CONFIDENCE:
                     logger.info(
                         "[window %d] MATCH — song_id=%s name=%r confidence=%.4f offset=%.2fs",
-                        window_count, best_id, song_name, confidence, offset_s,
+                        window_count, active_id, active_name, active_conf, active_off_s,
                     )
                     await websocket.send_json({
                         "matched":    True,
-                        "name":       song_name,
-                        "confidence": round(confidence, 4),
-                        "offset_s":   offset_s,
+                        "name":       active_name,
+                        "confidence": round(active_conf, 4),
+                        "offset_s":   active_off_s,
                         "timestamp":  time.strftime("%H:%M:%S"),
                     })
                     await websocket.close()

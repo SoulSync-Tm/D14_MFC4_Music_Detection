@@ -1,32 +1,50 @@
 """
-app/core/matcher.py — Bandpass filter, offset-alignment voting, and worker
-==========================================================================
+app/core/matcher.py — Matching primitives, consensus voting, and worker threads
+===============================================================================
 
+Public API
+----------
 bandpass(y, sr, low=300, high=3400) -> np.ndarray
-    4th-order Butterworth bandpass filter.  Called by ``AudioFingerprinter``
-    when ``is_phone_mode=True`` to simulate telephone / GSM channel conditions
-    (300–3400 Hz passband, 8 kHz sample rate).
+    4th-order Butterworth bandpass filter (300–3400 Hz).  Used by
+    ``AudioFingerprinter`` when ``is_phone_mode=True`` to simulate telephone
+    / GSM channel conditions.
 
 match_sample(r, sample_hashes) -> (song_id, best_offset, best_score)
-    Core matching function.
+    Low-level Redis lookup + offset-alignment voting.
+    Batch-queries ``fp:{hash}`` lists in one pipeline round-trip and returns
+    the (song_id, offset_bucket, vote_count) triple for the histogram peak.
+    Returns ``(None, None, 0)`` on no match.
 
-    1. Batch-queries Redis ``fp:{hash_value}`` lists for every hash in
-       ``sample_hashes`` using a single pipeline round-trip.
-    2. For every matching entry, increments a vote counter:
-           votes[song_id][db_time_offset − query_time_offset] += 1
-       Offset-alignment makes matching invariant to playback position.
-    3. Returns the (song_id, offset_bucket, vote_count) triple for the
-       peak of the vote histogram.  Returns ``(None, None, 0)`` on no match.
+fingerprint_only(fp, y) -> (hashes, hash_to_query_times)
+    Pure-CPU step: STFT → peaks → 64-bit landmark hashes.
+    No Redis I/O — safe to run in a thread executor alongside async code.
 
-match_audio(r, fp, y) -> (song_id | None, confidence: float)
-    Fingerprint one audio chunk and return the best matching song.
+score_matches(hashes, hash_to_query_times, db_rows) -> (best_id, confidence, offset_bins)
+    Pure-CPU voting step.  Aggregates offset-alignment votes from Redis rows,
+    returns the highest-confidence song id, its normalised confidence score,
+    and the winning time-delta bucket (spectrogram frames) as the playback
+    offset.  Convert to seconds: ``offset_bins * hop_length / sample_rate``.
+
+match_audio(r, fp, y) -> (song_id | None, confidence, offset_bins)
+    Full pipeline wrapper: fingerprint_only → match_fingerprints_bulk → score_matches.
+    Kept for non-async callers (e.g. matcher_worker).
+
+ConsensusVoter
+    Accumulates per-song vote counts across successive detection windows.
+    Returns a confirmed result only when the same song wins at least
+    *threshold* windows.  Eliminates single-window false positives.
+
+SongTracker
+    Temporal smoothing layer above ConsensusVoter.  Holds the last confirmed
+    song alive for *hold_time* seconds even when intervening windows yield
+    no consensus.  Prevents brief fingerprint dropouts from resetting a
+    valid detection chain.
 
 matcher_worker(audio_queue, stop_flag, on_match, on_no_match) -> None
-    Consume chunks from audio_queue and invoke result callbacks.
+    Thread consumer — dequeues PCM chunks, calls match_audio, fires callbacks.
 
-start_matcher_worker(audio_queue, stop_flag, on_match, on_no_match) -> threading.Thread
-    Convenience wrapper — starts matcher_worker in a daemon Thread and
-    returns the Thread object.
+start_matcher_worker(...) -> threading.Thread
+    Convenience wrapper — starts matcher_worker in a daemon thread.
 """
 
 import queue
@@ -166,6 +184,160 @@ def score_matches(hashes, hash_to_query_times, db_rows) -> tuple:
     best_id          = max(scores, key=scores.get)
     best_offset_bins = max(votes[best_id], key=votes[best_id].get)
     return best_id, scores[best_id], best_offset_bins
+
+
+class ConsensusVoter:
+    """
+    Accumulates per-song votes across successive detection windows and confirms
+    a match only when the same song wins at least *threshold* windows in a row
+    (or across the session, depending on use).  Eliminates single-window false
+    positives that arise from noise or partial fingerprint overlap.
+
+    Usage::
+
+        voter = ConsensusVoter(threshold=3)
+
+        # After each score_matches() call:
+        confirmed_id, confirmed_conf, confirmed_offset = voter.vote(
+            best_id, confidence, offset_bins
+        )
+        if confirmed_id is not None:
+            # Genuine match
+            ...
+
+    Call ``voter.reset()`` to clear all counters (e.g. after a confirmed match
+    or a timeout).
+    """
+
+    def __init__(self, threshold: int = 3) -> None:
+        self.threshold  = threshold
+        self._counts:   dict[int, int]   = {}   # song_id → vote count
+        self._conf_sum: dict[int, float] = {}   # song_id → sum of confidences
+        self._offset:   dict[int, int]   = {}   # song_id → latest offset_bins
+
+    def vote(self, best_id, confidence: float, offset_bins: int) -> tuple:
+        """
+        Register a single detection result and return a confirmed match once
+        the vote threshold is reached.
+
+        Parameters
+        ----------
+        best_id      : int | None   — winning song_id from score_matches()
+        confidence   : float        — confidence score for this window
+        offset_bins  : int          — spectrogram-frame offset for this window
+
+        Returns
+        -------
+        (confirmed_id, avg_confidence, offset_bins)
+        confirmed_id is None when the threshold has not yet been reached.
+        """
+        if best_id is None:
+            return None, 0.0, 0
+
+        self._counts[best_id]    = self._counts.get(best_id, 0) + 1
+        self._conf_sum[best_id]  = self._conf_sum.get(best_id, 0.0) + confidence
+        self._offset[best_id]    = offset_bins
+
+        if self._counts[best_id] >= self.threshold:
+            avg_conf = self._conf_sum[best_id] / self._counts[best_id]
+            return best_id, avg_conf, self._offset[best_id]
+
+        return None, 0.0, 0
+
+    def reset(self) -> None:
+        """Clear all accumulated votes."""
+        self._counts.clear()
+        self._conf_sum.clear()
+        self._offset.clear()
+
+
+class SongTracker:
+    """
+    Temporal smoothing layer that sits above ConsensusVoter.
+
+    Keeps the last confirmed song active for *hold_time* seconds even when
+    intervening windows return no consensus.  Eliminates jitter caused by
+    brief fingerprint dropouts mid-song.
+
+    Usage::
+
+        tracker = SongTracker(hold_time=4.0)
+
+        # After each voter.vote() call:
+        active_id, active_name, active_conf, active_off_s = tracker.update(
+            confirmed_id, confirmed_conf, offset_s, name
+        )
+        if active_id is not None:
+            # Song is confirmed or held — send match to client
+            ...
+
+    Parameters
+    ----------
+    hold_time : float
+        Seconds to hold a confirmed song alive after the last positive hit.
+    """
+
+    def __init__(self, hold_time: float = 4.0) -> None:
+        self.hold_time     = hold_time
+        self.current_id:   int | None  = None
+        self.current_name: str | None  = None
+        self.current_off_s: float      = 0.0
+        self._last_seen:   float       = 0.0
+
+    def update(
+        self,
+        confirmed_id,
+        confirmed_conf: float,
+        offset_s:       float,
+        name:           str | None = None,
+        now:            float | None = None,
+    ) -> tuple:
+        """
+        Advance the tracker with the latest consensus result.
+
+        Parameters
+        ----------
+        confirmed_id   : int | None   Song id from ConsensusVoter (None = no consensus)
+        confirmed_conf : float        Confidence from ConsensusVoter
+        offset_s       : float        Playback offset in seconds
+        name           : str | None   Resolved song name (only needed on a fresh hit)
+        now            : float | None Wall-clock time; uses time.time() if omitted
+
+        Returns
+        -------
+        (active_id, active_name, active_conf, active_off_s)
+        active_id is None when no song is active (no hit and hold expired).
+        """
+        import time as _time
+        if now is None:
+            now = _time.time()
+
+        if confirmed_id is not None:
+            # Fresh consensus hit — refresh or start tracking
+            if self.current_id != confirmed_id:
+                # Different song: lock in offset from this first confirming window
+                self.current_off_s = offset_s
+            self.current_id   = confirmed_id
+            self.current_name = name if name is not None else self.current_name
+            self._last_seen   = now
+            return self.current_id, self.current_name, confirmed_conf, self.current_off_s
+
+        if self.current_id is not None and (now - self._last_seen < self.hold_time):
+            # No new hit but within hold window — keep the existing song alive
+            return self.current_id, self.current_name, confirmed_conf, self.current_off_s
+
+        # Hold expired or never set — nothing active
+        self.current_id    = None
+        self.current_name  = None
+        self.current_off_s = 0.0
+        return None, None, 0.0, 0.0
+
+    def reset(self) -> None:
+        """Clear tracked state."""
+        self.current_id    = None
+        self.current_name  = None
+        self.current_off_s = 0.0
+        self._last_seen    = 0.0
 
 
 def match_audio(r, fp, y) -> tuple:

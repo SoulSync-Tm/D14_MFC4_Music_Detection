@@ -6,19 +6,43 @@ RingBuffer
     Pre-allocated fixed-capacity float32 ring buffer.  Accepts raw PCM chunks
     and yields sliding windows of a fixed length with a configurable step.
 
-Usage
------
-    buf = RingBuffer(window_size=9600, step_size=2400)
+    Design goals
+    ~~~~~~~~~~~~
+    * Zero per-window allocation — ``windows()`` yields numpy views into the
+      pre-allocated backing array, not copies.
+    * O(n) append — a single C-level memcpy per packet via numpy slice assignment.
+    * O(1) slide — ``read_pos`` is advanced by an integer add; no data is moved.
+    * Bounded compaction — the backing array is only shifted when the tail
+      space cannot fit the next incoming packet.  With ``capacity_multiplier=4``
+      this happens at most once every ``3 × window_size`` samples.
 
-    # On each incoming packet:
-    buf.extend(pcm)                   # write samples — O(n), no allocation
+    Usage
+    ~~~~~
+    ::
 
-    for window in buf.windows():      # iterate ready windows — zero-copy views
-        process(window)
+        buf = RingBuffer(window_size=9600, step_size=2400)
 
-Changing the windowing strategy (tumbling vs. sliding, different overlap, etc.)
-only requires editing this file — websocket.py is unaffected.
+        # On each incoming packet
+        buf.extend(pcm)               # write samples — O(n), no allocation
+
+        for window in buf.windows():  # iterate ready windows — zero-copy views
+            process(window)
+
+    Windowing strategy
+    ~~~~~~~~~~~~~~~~~~
+    The default is an overlapping **sliding window**::
+
+        window_size=9600, step_size=2400  (WINDOW_DURATION=1.2s, STEP_DURATION=0.3s)
+
+        Window 1: samples   0 –  9599   (0.0 – 1.2 s)
+        Window 2: samples 2400 – 11999   (0.3 – 1.5 s)
+        Window 3: samples 4800 – 14399   (0.6 – 1.8 s)
+        ...
+
+    To change the strategy (tumbling windows, multi-resolution, etc.) only
+    this file needs editing — websocket.py is unaffected.
 """
+
 
 import numpy as np
 

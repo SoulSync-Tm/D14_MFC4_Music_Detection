@@ -1,6 +1,444 @@
 # Shazam-Style Audio Fingerprinting System
 
-A Python implementation of Shazam-style audio fingerprinting for song identification from short clips (~4 seconds). Uses spectral peak detection, anchor-target constellation mapping, and offset-alignment voting for robust matching — even under noise or telephone-quality audio.
+A real-time Python implementation of Shazam-style audio fingerprinting. Identifies songs from a live microphone stream in under 5 seconds using spectral peak detection, anchor-target constellation mapping, offset-alignment voting, consensus gating, and temporal smoothing — robust to background noise and telephone-quality audio.
+
+## 📋 Table of Contents
+
+- [Overview](#-overview)
+- [Why Preprocessing?](#-why-does-audio-need-preprocessing)
+- [Project Structure](#-project-structure)
+- [Quick Start](#-quick-start)
+- [System Architecture](#-system-architecture)
+- [Real-Time Streaming Pipeline](#-real-time-streaming-pipeline)
+- [Scripts Reference](#-scripts-reference)
+- [Configuration](#-configuration)
+- [Evaluation](#-evaluation)
+- [Robustness](#-robustness-features)
+- [Docker Setup](#-docker-setup)
+- [References](#-references)
+
+## 🎯 Overview
+
+This system implements industry-standard Shazam-style audio fingerprinting featuring:
+
+- **Audio Preprocessing**: Mono conversion, resampling to 8 kHz, DC removal, amplitude normalisation, optional bandpass filtering (phone mode)
+- **Spectral Analysis**: STFT with configurable FFT size and hop length
+- **Peak Detection**: Local maxima via `maximum_filter` with percentile-based amplitude thresholding
+- **64-bit Fingerprint Hashing**: Anchor-target pairing packed as `[f1·9-bit][f2·9-bit][Δt·8-bit]`
+- **Redis Fingerprint Store**: Hash lists at `fp:{hash_value}` keys; single pipeline round-trip per query
+- **Offset-Alignment Voting**: Time-invariant matching robust to recording offset
+- **Real-Time WebSocket Streaming**: Live microphone → server over `/ws/stream`; int16 wire encoding (half the bandwidth of float32)
+- **Ring-Buffer Windowing**: Pre-allocated numpy ring buffer; zero-copy window views, O(1) slide
+- **Consensus Voting**: Requires the same song to win 3 successive windows before confirming — eliminates single-window false positives
+- **Temporal Smoothing**: Holds the last confirmed song for 4 seconds across brief fingerprint dropout windows
+- **Playback Offset**: Reports the position in the original song (minutes:seconds) where the matched audio was recorded
+- **30-Second Timeout**: Server and client both abandon the session gracefully after 30 s without a confirmed match
+- **Parameter Tuning**: Grid-search script to find optimal fingerprinter parameters
+
+---
+
+## 🔥 Why Does Audio Need Preprocessing?
+
+Real-world audio recordings are rarely clean. Noise and distortion are introduced at multiple stages of the recording chain.
+
+| Source | Description |
+|---|---|
+| **Cheap Microphones** | Low-quality capsules introduce self-noise and frequency coloration |
+| **ADC Imperfections** | Quantization noise, clipping, and non-linearity errors during analog → digital conversion |
+| **Recording Devices** | Power supply hum (50/60 Hz), poor shielding bleed into the signal |
+| **Compression Artifacts** | Lossy codecs (MP3, AAC) discard high-frequency detail and introduce ringing artifacts |
+| **Telephone / GSM Channels** | Band-limited to 300–3400 Hz, heavily compressed, low bitrate |
+
+### 🛠️ How Preprocessing Fixes This
+
+1. **Mono Conversion** — Collapses stereo to a single channel; eliminates channel imbalance.
+2. **Resampling to 8000 Hz** — Standardises the sample rate; 8 kHz captures up to 4 kHz — sufficient for telephone-quality fingerprinting.
+3. **Amplitude Normalisation** — Scales peak amplitude to ±1; removes recording level differences.
+4. **DC Removal** — Subtracts the mean; eliminates DC offset from cheap ADCs.
+5. **Pre-emphasis** — Boosts high-frequency energy to compensate for spectral roll-off.
+6. **Bandpass Filter (phone mode)** — 4th-order Butterworth 300–3400 Hz; simulates telephone/GSM channel conditions.
+7. **Percentile Peak Thresholding** — Retains only the top 15% of spectral energy peaks as landmarks.
+
+---
+
+## 📁 Project Structure
+
+```
+music-detection/
+├── app/
+│   ├── main.py                # FastAPI app + uvicorn entry point
+│   ├── config.py              # All tuneable constants (SAMPLE_RATE, WINDOW_SIZE, etc.)
+│   ├── api/
+│   │   ├── routes.py          # HTTP routes
+│   │   └── websocket.py       # /ws/stream WebSocket endpoint
+│   ├── core/
+│   │   ├── fingerprint.py     # AudioFingerprinter — preprocess, spectrogram, peaks, hashes
+│   │   ├── matcher.py         # bandpass, match_sample, fingerprint_only, score_matches,
+│   │   │                      #   match_audio, ConsensusVoter, SongTracker, matcher_worker
+│   │   ├── buffer.py          # RingBuffer — pre-allocated sliding-window ring buffer
+│   │   └── streaming.py       # Microphone audio producer (CLI streaming path)
+│   ├── db/
+│   │   ├── redis.py           # Redis connection helper
+│   │   └── fingerprint_repo.py  # match_fingerprints_bulk — pipeline batch query
+│   ├── models/
+│   │   ├── song.py            # Song model
+│   │   └── response.py        # API response models
+│   ├── services/
+│   │   ├── fingerprint_service.py
+│   │   └── recognition_service.py
+│   └── utils/
+│       ├── audio.py
+│       └── logging.py         # get_logger helper
+├── scripts/
+│   ├── client.py              # WebSocket microphone client (uv run client)
+│   ├── insert_songs.py        # Register songs in Redis
+│   ├── fingerprint_songs.py   # Compute & store fingerprints
+│   ├── create_samples.py      # Generate clean + noisy test clips
+│   ├── match_song.py          # Match a single audio file
+│   ├── evaluate_system.py     # Batch evaluation across clean/noisy samples
+│   ├── tune_params.py         # Grid-search parameter tuning
+│   ├── stream_audio.py        # CLI microphone streaming (non-WebSocket path)
+│   └── drop_tables.py         # Reset Redis fingerprint store
+├── data/
+│   ├── songs/                 # Full-length audio files (MP3/WAV/FLAC/OGG)
+│   ├── samples/               # Clean test clips
+│   ├── samples_noisy/         # Gaussian-noisy variants
+│   └── test/                  # Manual test files
+├── experiments/
+│   ├── experiment.ipynb
+│   └── toy_example.ipynb
+├── docker-compose.yml
+├── pyproject.toml
+└── requirements.txt
+```
+
+---
+
+## 🚀 Quick Start
+
+### Prerequisites
+
+- **Python 3.10+** and **uv** (`pip install uv`)
+- **Redis** running on `localhost:6379` (or via Docker)
+- Audio files placed in `data/songs/`
+
+### Setup
+
+```bash
+# Install dependencies
+uv sync
+
+# Start Redis (if using Docker)
+docker compose up -d redis
+```
+
+### Full Pipeline (run in order)
+
+```bash
+# 1. Register song names in Redis
+uv run python scripts/insert_songs.py
+
+# 2. Compute and store fingerprints
+uv run python scripts/fingerprint_songs.py
+
+# 3. Start the server
+uv run app-main
+# or: uv run -m app.main
+
+# 4. In another terminal — stream from microphone
+uv run client
+# or: uv run python scripts/client.py
+```
+
+---
+
+## 🏗️ System Architecture
+
+### Core Modules
+
+| Module | Responsibility |
+|---|---|
+| `app/core/fingerprint.py` | `AudioFingerprinter` — preprocess audio, STFT spectrogram, peak detection, 64-bit landmark hashes |
+| `app/core/matcher.py` | `fingerprint_only`, `score_matches`, `match_audio`, `ConsensusVoter`, `SongTracker`, `matcher_worker` |
+| `app/core/buffer.py` | `RingBuffer` — pre-allocated sliding-window ring buffer, zero-copy window views |
+| `app/db/fingerprint_repo.py` | `match_fingerprints_bulk` — Redis pipeline batch query |
+| `app/api/websocket.py` | `/ws/stream` WebSocket endpoint — full real-time pipeline |
+| `scripts/client.py` | Microphone WebSocket client with live status display |
+
+### Data Flow
+
+```
+ INDEXING (offline)
+ ──────────────────────────────────────────────────
+  data/songs/*.mp3/wav
+        │
+        ▼
+  AudioFingerprinter     preprocess → spectrogram → peaks → hashes
+        │
+        ▼
+  Redis                  LPUSH fp:{hash_value} "{song_id}:{time_offset}"
+
+
+ REAL-TIME STREAMING (per connection)
+ ──────────────────────────────────────────────────
+  Microphone (int16, 8 kHz, 0.5 s packets)
+        │  WebSocket binary frames
+        ▼
+  RingBuffer             sliding windows (1.2 s / 0.3 s step)
+        │  window (9600 samples)
+        ▼
+  fingerprint_only       STFT → peaks → hashes          [thread executor]
+        │  hashes
+        ▼
+  match_fingerprints_bulk  Redis pipeline round-trip     [thread executor]
+        │  db_rows
+        ▼
+  score_matches          offset-alignment voting → (best_id, confidence, offset_bins)
+        │
+        ▼
+  ConsensusVoter         require 3 windows to agree → confirmed result
+        │
+        ▼
+  SongTracker            hold confirmed song for 4 s across dropout windows
+        │
+        ▼
+  WebSocket JSON         {"matched": true, "name": "...", "confidence": 0.23,
+                          "offset_s": 34.56, "timestamp": "14:05:01"}
+```
+
+---
+
+## 🎙 Real-Time Streaming Pipeline
+
+### Wire Protocol
+
+| Direction | Format | Detail |
+|---|---|---|
+| Client → Server | Binary | int16 LE PCM, mono, 8 kHz, 0.5 s / frame |
+| Server → Client | UTF-8 JSON | One message per processed window |
+
+### Server Response Messages
+
+```jsonc
+// No match yet
+{"matched": false}
+
+// 30-second timeout
+{"matched": false, "reason": "timeout"}
+
+// Confirmed match
+{
+  "matched":    true,
+  "name":       "Song Title",
+  "confidence": 0.23,     // average confidence over confirming windows
+  "offset_s":   34.56,    // playback position in original song (seconds)
+  "timestamp":  "14:05:01"
+}
+```
+
+### Detection Latency
+
+With default settings, the first confirmed match can arrive as early as:
+
+| Stage | Time |
+|---|---|
+| Buffer fills first window | ~1.2 s |
+| 3 consensus windows (×0.3 s step) | +0.9 s |
+| Fingerprint + Redis per window | ~0.2–0.5 s |
+| **Typical time-to-match** | **~3–5 s** |
+
+### Client Output
+
+```
+Connected to ws://localhost:8000/ws/stream
+Listening via microphone — 0.5s packets at 8000 Hz
+Will give up after 30s without a match.
+
+Listening…  8.5s elapsed  (22s remaining)
+
+MATCH → thee_koluthi  confidence=0.183  offset=1m24.32s  14:05:01
+Done — 17 packets sent
+```
+
+---
+
+## 📜 Scripts Reference
+
+### `scripts/client.py`
+WebSocket microphone client. Streams int16 PCM from the system microphone, prints a live status line, and exits immediately on match or after 30 s.
+
+```bash
+uv run client
+```
+
+### `scripts/insert_songs.py`
+Scans `data/songs/` for audio files and registers each name in Redis. Safe to re-run — skips duplicates.
+
+```bash
+uv run python scripts/insert_songs.py
+```
+
+### `scripts/fingerprint_songs.py`
+For each registered song, computes fingerprints and stores hash lists in Redis.
+
+```bash
+uv run python scripts/fingerprint_songs.py
+```
+
+### `scripts/create_samples.py`
+Generates short test clips from each song — clean and Gaussian-noisy variants.
+
+| Setting | Value |
+|---|---|
+| Clip duration | 4 seconds |
+| Clips per song | 10 |
+| Sample rate | 8000 Hz |
+| Noise levels | light (SNR +10 dB), medium (SNR 0 dB), heavy (SNR −5 dB) |
+
+```bash
+uv run python scripts/create_samples.py
+```
+
+### `scripts/match_song.py`
+Match a single audio file against the fingerprint store.
+
+```bash
+uv run python scripts/match_song.py data/test/thee_koluthi.wav
+```
+
+### `scripts/evaluate_system.py`
+Batch evaluation across all clean and noisy samples. Reports Top-1 accuracy, Top-3 accuracy, and no-match rate per noise level.
+
+```bash
+uv run python scripts/evaluate_system.py
+```
+
+### `scripts/tune_params.py`
+Grid-search over fingerprinter parameters.
+
+```bash
+uv run python scripts/tune_params.py
+```
+
+### `scripts/drop_tables.py`
+Clears all fingerprint data from Redis (requires confirmation).
+
+```bash
+uv run python scripts/drop_tables.py
+```
+
+---
+
+## 🔧 Configuration
+
+All constants live in `app/config.py` and can be overridden with environment variables.
+
+### Audio / Streaming
+
+| Parameter | Default | Description |
+|---|---|---|
+| `SAMPLE_RATE` | 8000 Hz | Wire and processing sample rate |
+| `PACKET_DURATION` | 0.5 s | Client packet length |
+| `WINDOW_DURATION` | 1.2 s | Fingerprinting window length |
+| `STEP_DURATION` | 0.3 s | Sliding window step |
+| `PACKET_SIZE` | 4000 samples | `SAMPLE_RATE × PACKET_DURATION` |
+| `WINDOW_SIZE` | 9600 samples | `SAMPLE_RATE × WINDOW_DURATION` |
+| `STEP_SIZE` | 2400 samples | `SAMPLE_RATE × STEP_DURATION` |
+| `MIN_CONFIDENCE` | 0.1 | Minimum normalised confidence to accept a match |
+
+### Fingerprinter (`AudioFingerprinter`)
+
+| Parameter | Default | Description |
+|---|---|---|
+| `n_fft` | 1024 | STFT window size |
+| `hop_length` | 256 | STFT hop (frame step) |
+| `fan_value` | 10 | Target peaks per anchor |
+| `target_zone_time` | 50 | Max frame gap anchor→target |
+
+### Matching / Streaming
+
+| Parameter | Default | Description |
+|---|---|---|
+| `ConsensusVoter.threshold` | 3 | Windows required to confirm a match |
+| `SongTracker.hold_time` | 4.0 s | Seconds to hold a song across dropout windows |
+| `MAX_STREAM_TIME` | 30 s | Hard server timeout per connection |
+| `LISTEN_TIMEOUT` | 30 s | Hard client timeout |
+
+### Bandpass Filter
+
+| Parameter | Value |
+|---|---|
+| Filter type | 4th-order Butterworth |
+| Low cutoff | 300 Hz |
+| High cutoff | 3400 Hz |
+| Applied when | `is_phone_mode=True` |
+
+---
+
+## 📊 Evaluation
+
+### Matching Algorithm
+
+1. **Ring-buffer windowing** — overlapping 1.2 s windows slide every 0.3 s
+2. **Fingerprint** — STFT → log-magnitude spectrogram → peak detection → 64-bit hashes
+3. **Redis batch query** — all hashes fetched in one pipeline round-trip
+4. **Offset-alignment voting** — `votes[song_id][db_offset − query_offset] += 1`; position-invariant
+5. **Score normalisation** — `confidence = peak_votes / total_query_hashes`
+6. **Consensus gate** — same song must win 3 windows
+7. **Temporal smoothing** — song held for 4 s across dropout windows
+8. **Playback offset** — `offset_s = offset_bins × hop_length / sample_rate`
+
+### Expected Performance
+
+| Condition | Top-1 Accuracy |
+|---|---|
+| Clean samples | ~95–100% |
+| Light noise (SNR +10 dB) | ~90–98% |
+| Medium noise (SNR 0 dB) | ~75–90% |
+| Heavy noise (SNR −5 dB) | ~50–75% |
+
+---
+
+## 🔐 Robustness Features
+
+- ✅ Volume changes — amplitude normalisation before hashing
+- ✅ Recording offset — offset-alignment voting is position-independent
+- ✅ Compression artifacts — high fan-out creates overlapping, redundant hashes
+- ✅ Background noise — percentile thresholding retains only dominant spectral peaks
+- ✅ Device/sample-rate variation — all audio resampled to 8000 Hz
+- ✅ Telephone/GSM channels — bandpass mode + `--phone-mode` query path
+- ✅ False positives — consensus voting requires 3 agreeing windows
+- ✅ Dropout windows — temporal smoothing holds the song for 4 s
+- ✅ Event-loop blocking — CPU and Redis work run in thread executors
+- ✅ Bandwidth — int16 wire encoding halves bytes vs float32
+
+---
+
+## 🐳 Docker Setup
+
+```bash
+# Start Redis + app
+docker compose up
+
+# Or start Redis only and run the app locally
+docker compose up -d redis
+uv run app-main
+```
+
+---
+
+## 📚 References
+
+- Wang, A. (2003). *An Industrial-Strength Audio Search Algorithm.* Shazam Entertainment.
+- Librosa documentation: https://librosa.org/
+- STFT: https://en.wikipedia.org/wiki/Short-time_Fourier_transform
+
+---
+
+## 📄 License
+
+Educational project — S4 MFC Course.
+
 
 ## 📋 Table of Contents
 
