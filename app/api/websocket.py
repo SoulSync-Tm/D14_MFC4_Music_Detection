@@ -14,74 +14,27 @@ Client → Server : Raw PCM binary frames, int16 little-endian, mono, 8 kHz.
 
 Server → Client : UTF-8 JSON, one message per processed window.
 
-    No match yet::
-
-        {"matched": false}
-
-    Timeout (30 s elapsed, no confirmed song)::
-
-        {"matched": false, "reason": "timeout"}
-
-    Confirmed match::
-
-        {
-          "matched":    true,
-          "name":       "Song Title",
-          "confidence": 0.23,        # average over confirming windows
-          "offset_s":   34.56,       # playback position in the original song
-          "timestamp":  "14:05:01"   # wall-clock time of confirmation
-        }
-
-Pipeline (per window)
----------------------
-1. ``RingBuffer`` accumulates int16 PCM packets and emits sliding windows
-   of WINDOW_SIZE samples (1.2 s) with a STEP_SIZE step (0.3 s).
-
-2. ``fingerprint_only`` (CPU, thread executor)
-   STFT → log-magnitude spectrogram → peak detection → 64-bit landmark hashes.
-
-3. ``match_fingerprints_bulk`` (I/O, thread executor)
-   Single Redis pipeline round-trip — fetches all ``fp:{hash}`` lists.
-
-4. ``score_matches`` (CPU, inline)
-   Offset-alignment voting → best_id, confidence, offset_bins.
-
-5. ``ConsensusVoter`` (stateful, per-connection)
-   Requires the same song to win *threshold* (default 3) successive windows
-   before a result is considered genuine.  Suppresses single-window false
-   positives from noise bursts.
-
-6. ``SongTracker`` (stateful, per-connection)
-   Holds the last confirmed song for HOLD_TIME seconds (default 4 s) even
-   when intervening windows yield no consensus.  Prevents brief dropout
-   windows from breaking a valid match chain.
-
-7. 30-second hard timeout — if no match is confirmed within MAX_STREAM_TIME
-   the server sends a timeout JSON and closes the connection.
+Pipeline
+--------
+1. ``bytes_to_pcm`` converts each incoming binary frame to float32 PCM.
+2. ``RingBuffer`` accumulates samples and emits sliding windows.
 """
 
-import asyncio
-import time
+from collections import deque
+import datetime
 
-import numpy as np
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from app.config import MIN_CONFIDENCE, SAMPLE_RATE, WINDOW_SIZE
-from app.core.buffer import RingBuffer
+from app.config import SAMPLE_RATE, MIN_CONFIDENCE
 from app.core.fingerprint import AudioFingerprinter
-from app.core.matcher import (
-    fingerprint_only,
-    score_matches,
-    ConsensusVoter,
-    SongTracker,
-)
-from app.db.fingerprint_repo import match_fingerprints_bulk
-from app.db.redis import get_connection
+from app.core.buffer import RingBuffer
+from app.utils.audio import bytes_to_pcm, build_hashes, find_best_match, offset_vote
 from app.utils.logging import get_logger
+from app.db.fingerprint_repo import match_fingerprints_bulk, song_name_from_id
+from app.db.redis import get_connection
 
 ws_router = APIRouter()
 
-_fp = AudioFingerprinter()
 logger = get_logger(__name__)
 logger.setLevel(10)  # DEBUG
 
@@ -90,119 +43,120 @@ logger.setLevel(10)  # DEBUG
 async def stream_audio(websocket: WebSocket) -> None:
     await websocket.accept()
     logger.info("WebSocket connection accepted from %s", websocket.client)
+    buf: RingBuffer = RingBuffer()
+    audioFingerprinter: AudioFingerprinter = AudioFingerprinter(sample_rate=SAMPLE_RATE)
     r = get_connection()
-    buf = RingBuffer()
-    voter = ConsensusVoter(threshold=3)
-    tracker = SongTracker(hold_time=4.0)
-    loop = asyncio.get_event_loop()
 
-    MAX_STREAM_TIME = 30
-    start_time = time.time()
     chunk_count = 0
     window_count = 0
+    sample_counter = 0
+    STEP_SAMPLES = int(0.3 * 8000)
+    peak_buffer: deque[tuple[int, int]] = deque()  # stores (freq, time_frame)
+    last_processed_frame = -1
+    DELTA_T_MAX = 80
 
     try:
         while True:
-            if time.time() - start_time > MAX_STREAM_TIME:
-                logger.info(
-                    "Stream timeout after %ds — no match found", MAX_STREAM_TIME
-                )
-                await websocket.send_json({"matched": False, "reason": "timeout"})
-                await websocket.close()
-                return
-
             data = await websocket.receive_bytes()
             chunk_count += 1
-            pcm_int16 = np.frombuffer(data, dtype=np.int16)
-            pcm = pcm_int16.astype(np.float32) / 32768.0
-            buf.extend(pcm)
-            logger.debug(
-                "[chunk %d] %d bytes | %d samples | buffer=%d/%d",
-                chunk_count,
-                len(data),
-                len(pcm),
-                buf.buffered,
-                WINDOW_SIZE,
+            pcm = bytes_to_pcm(data)
+            buf.append(pcm)
+            sample_counter += len(pcm)
+            logger.info(
+                "chunk=%d samples=%d buffer_index=%d", chunk_count, len(pcm), buf.index
             )
 
-            for window in buf.windows():
-                window_count += 1
-                logger.debug(
-                    "[window %d] fingerprinting %d samples (%.2f s)",
-                    window_count,
-                    WINDOW_SIZE,
-                    WINDOW_SIZE / SAMPLE_RATE,
+            if buf.is_full:
+                logger.info("Buffer is full. Ready to emit windows.")
+
+            if sample_counter >= STEP_SAMPLES:
+                # making sure that we emit a window every 0.3 seconds, even if the buffer is not full yet
+                sample_counter = 0
+
+                # getting the array buffered in the ring buffer and processing it to generate hashes
+                window = buf.get_window()
+                # Ignore silence
+                # if np.mean(np.abs(window)) < 0.01:
+                #     logger.info("Skipping silent window.")
+                #     continue
+                S_db = audioFingerprinter.generate_spectrogram(window)
+                peaks = audioFingerprinter.find_peaks(S_db)
+
+                new_peaks = [p for p in peaks if p[1] > last_processed_frame]
+                hashes = build_hashes(
+                    audioFingerprinter,
+                    peaks,
+                    peak_buffer,
+                    last_processed_frame,
+                    DELTA_T_MAX,
                 )
+                if peaks:
+                    last_processed_frame = peaks[-1][1]
+                peak_buffer.extend(new_peaks)
+                while peak_buffer and (
+                    last_processed_frame - peak_buffer[0][1] > DELTA_T_MAX
+                ):
+                    peak_buffer.popleft()
 
-                # CPU fingerprinting — off event loop
-                hashes, hash_to_query_times = await loop.run_in_executor(
-                    None, fingerprint_only, _fp, window
-                )
+                if hashes:
+                    # find matches in the database and send back the best match with confidence
+                    hash_values = [h[0] for h in hashes]
+                    matches = match_fingerprints_bulk(r, hash_values)
+                    votes = offset_vote(matches, hashes)
+                    best_song, best_offset, best_votes = find_best_match(votes)
+                    confidence = best_votes / len(hashes) if hashes else 0.0
+                    if best_offset is not None:
+                        offset_seconds = (
+                            best_offset * audioFingerprinter.hop_length / SAMPLE_RATE
+                        )
+                    else:
+                        offset_seconds = 0.0
 
-                if not hashes:
-                    logger.debug("[window %d] no hashes generated", window_count)
-                    await websocket.send_json({"matched": False})
-                    continue
+                    timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+                    song_name = (
+                        song_name_from_id(r, best_song) if best_song else "Unknown"
+                    )
+                    # Require minimum votes for reliability
+                    if best_votes < 10:
+                        logger.info("Skipping match: not enough votes (%d)", best_votes)
+                        logger.info(
+                            "Matches found: %d,song_name: %s, but below threshold. Confidence=%.2f",
+                            len(matches),
+                            song_name,
+                            confidence,
+                        )
+                        continue
+                    if confidence > MIN_CONFIDENCE:
+                        await websocket.send_json(
+                            {
+                                "matched": True,
+                                "name": song_name,
+                                "confidence": confidence,
+                                "offset_s": offset_seconds,
+                                "timestamp": timestamp,
+                            }
+                        )
+                        logger.info(
+                            "Match found: matches=%d song_id=%s offset=%d votes=%d confidence=%.2f name=%s",
+                            len(matches),
+                            best_song,
+                            best_offset,
+                            best_votes,
+                            confidence,
+                            song_name,
+                        )
+                        return
 
-                # Redis lookup — sync client in executor
-                hash_values = [int(h) for h, _ in hashes]
-                db_rows = await loop.run_in_executor(
-                    None, match_fingerprints_bulk, r, hash_values
-                )
-
-                # CPU scoring — fast, no I/O
-                best_id, confidence, offset_bins = score_matches(
-                    hashes, hash_to_query_times, db_rows
-                )
-
+                    pass
                 logger.info(
-                    "[window %d] best_id=%s confidence=%s votes=%s threshold=%s",
+                    "window=%d peaks=%d hashes=%d",
                     window_count,
-                    best_id,
-                    confidence,
-                    voter._counts.get(best_id, 0) + (1 if best_id is not None else 0),  # type: ignore[arg-type]
-                    MIN_CONFIDENCE,
+                    len(peaks),
+                    len(hashes),
                 )
 
-                # Consensus gate — require threshold windows to agree before confirming
-                confirmed_id, confirmed_conf, confirmed_offset = voter.vote(
-                    best_id, confidence, offset_bins
-                )
-                offset_s = round(confirmed_offset * _fp.hop_length / _fp.sample_rate, 2)
-
-                # Resolve name only on a fresh consensus hit (avoids a Redis call every window)
-                name = None
-                if confirmed_id is not None:
-                    raw_name: str | None = r.hget(f"song:{confirmed_id}", "name")
-                    name = raw_name if raw_name is not None else "Unknown"
-
-                # Temporal smoothing — hold the song across brief dropout windows
-                active_id, active_name, active_conf, active_off_s = tracker.update(
-                    confirmed_id, confirmed_conf, offset_s, name
-                )
-
-                if active_id is not None and active_conf >= MIN_CONFIDENCE:
-                    logger.info(
-                        "[window %d] MATCH — song_id=%s name=%r confidence=%.4f offset=%.2fs",
-                        window_count,
-                        active_id,
-                        active_name,
-                        active_conf,
-                        active_off_s,
-                    )
-                    await websocket.send_json(
-                        {
-                            "matched": True,
-                            "name": active_name,
-                            "confidence": round(active_conf, 4),
-                            "offset_s": active_off_s,
-                            "timestamp": time.strftime("%H:%M:%S"),
-                        }
-                    )
-                    await websocket.close()
-                    return
-
-                await websocket.send_json({"matched": False})
+                await websocket.send_json({"match": False})
+                window_count += 1
 
     except WebSocketDisconnect:
         logger.info(
@@ -211,6 +165,6 @@ async def stream_audio(websocket: WebSocket) -> None:
     except Exception as exc:
         logger.exception("[chunk %d] Unhandled error: %s", chunk_count, exc)
         try:
-            await websocket.send_json({"matched": False, "error": str(exc)})
+            await websocket.send_json({"error": str(exc)})
         except Exception:
             pass

@@ -18,3 +18,6 @@ database/*.db-journal
 database/*.db-wal
 database/*.db-shm
 experiments/
+.mypy_cache/
+.venv
+.ruff_cache/

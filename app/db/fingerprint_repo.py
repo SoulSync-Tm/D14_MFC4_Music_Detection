@@ -65,15 +65,17 @@ def match_fingerprints_bulk(
     if not hash_values:
         return []
 
-    unique_hashes = list(set(int(h) for h in hash_values))
+    unique_hashes = list(set(hash_values))
 
     pipe = r.pipeline()
     for hv in unique_hashes:
-        pipe.lrange(f"fp:{hv}", 0, -1)
+        pipe.lrange(f"fp:{hv}", 0, 200)  # Limit to 201 entries (0-200 inclusive)
     raw_results = pipe.execute()
 
     results = []
     for hv, entries in zip(unique_hashes, raw_results):
+        if len(entries) > 200:
+            continue  # Skip large buckets
         for entry in entries:
             sid_str, t_str = entry.split(":", 1)
             results.append((hv, int(sid_str), int(t_str)))
