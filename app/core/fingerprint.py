@@ -46,7 +46,6 @@ class AudioFingerprinter:
         self.n_fft = 1024
         self.hop_length = 256
         self.fan_value = 10
-        self.target_zone_time = 50
 
     def preprocess(
         self, file_path: str, is_phone_mode: bool = False

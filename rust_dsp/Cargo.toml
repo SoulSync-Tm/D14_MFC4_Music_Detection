@@ -1,0 +1,14 @@
+[package]
+name = "rust_dsp"
+version = "0.1.0"
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "rust_dsp"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = "0.27.0"
+numpy = "0.27"
+realfft="3.5.0"
